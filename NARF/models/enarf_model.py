@@ -39,11 +39,11 @@ class ENARFGenerator(nn.Module):
         self.channels = 32
         self.save_mask = False  # flag to save mask
         self.groups = 1
-
         self.density_scale = config.density_scale
-
         self.num_bone = num_bone
-        
+        self.t = torch.new_ones((bs,20))            # TODO: 实现 t modulate G_dec
+        self.parent_id = parent
+
         if self.config.use_gan:
             #synthesis_kwargs['use_noise'] = True
             self.synthesis = SynthesisNetwork(
@@ -54,14 +54,19 @@ class ENARFGenerator(nn.Module):
                                 use_noise = True)
             self.mapping = MappingNetwork(z_dim=self.z_dim, c_dim=self.c_dim, w_dim=self.w_dim, 
                                         num_ws=self.synthesis.num_ws, **mapping_kwargs)
-        #decoder_kwargs=dict(in_c=32, mid_c=64, out_c=4 )
-        decoder_kwargs = dict(in_channel=32, out_channel=4, kernel_size=3, style_dim=20)
-        #self.nerf_decoder = Decoder(**nerf_decoder_kwargs)
-        self.decoder = ModulatedConv2d(**decoder_kwargs)
-        self.parent_id = parent
-
-        self.bce = nn.BCEWithLogitsLoss()
-        self.l1 = nn.L1Loss()
+        if self.config.dynamic:
+            self.c_dim = 20 + 9 * (self.num_bone-1)
+            self.deform_synthesis = SynthesisNetwork(
+                                w_dim = self.w_dim, 
+                                img_resolution = size, 
+                                img_channels = 2 * 3,
+                                num_fp16_res=0,
+                                use_noise = True)
+            self.deform_mapping = MappingNetwork(z_dim=self.z_dim, c_dim=self.c_dim, w_dim=self.w_dim, 
+                                        num_ws=self.deform_synthesis.num_ws, **mapping_kwargs)        
+            self.decoder = ModulatedConv2d(in_channel=32, out_channel=4, kernel_size=3, style_dim=self.c_dim)
+        else:
+            self.decoder = ModulatedConv2d(**decoder_kwargs)
         
 
 
@@ -115,11 +120,16 @@ class ENARFGenerator(nn.Module):
         mask_probs = tri_probs.new_zeros((bs, n, self.num_bone, 1))
         for i in range(self.num_bone):
             mask_probs[ :, : , i, 0] = tri_probs[ :, : , i, i]
-        
         masked_features = mask_probs * features
+
+        if self.config.dynamic:
+            deform_xy, deform_yz, deform_xz = self.deform_features.chunk(3, dim=1)
+            deforms = self.bilinear_sample_tri_plane(p, deform_xy, deform_yz, deform_xz)
+            deforms = (deforms[0] + deforms[1] + deforms[2]).permute(0,3,2,1)
+            deform_probs = tri_probs.new_ones((bs, n, self.num_bone, 1)) / self.num_bone
+
         inter_features = masked_features.sum(2).permute(0, 2, 1).reshape(bs, self.channels, ray_direction.shape[-1], -1)        # 4 x n x 32 -> 4 x 32 x m x numsample
-        t = inter_features.new_ones((bs,20))                                       # TODO: 实现 t modulate G_dec
-        out = self.decoder(inter_features.contiguous(),t).reshape(bs, 4, -1)       # b x 4 x m x numsample
+        out = self.decoder(inter_features.contiguous(),self.t).reshape(bs, 4, -1)       # b x 4 x m x numsample
         density = out[:, 0:1, :]
         color = out[:, None, 1:, :]
         return density, color       # b x 1 x n    b x 1 x 3 x n
@@ -412,7 +422,6 @@ class ENARFGenerator(nn.Module):
                 world_pose=None, bone_length=None, thres=0.9, render_scale=1, Nc=64, Nf=128,
                 truncation_psi=1, truncation_cutoff=None, update_emas=True,
                 **synthesis_kwargs):
-        # TODO: 原文中使用poseconfig{l,R,t}调节G_tri,但不知道怎么调节 
         """
         rendering function for sampled rays
         :param batchsize:
@@ -433,8 +442,9 @@ class ENARFGenerator(nn.Module):
         # repeat coords along bone axis
         sampled_img_coord = sampled_img_coord.repeat(1, self.num_bone, 1, 1)    # b x num_bone x 3 x patch^2
         bs = pose_to_camera.shape[0]
+
         if self.config.use_gan:
-            cond = torch.cat((pose_to_camera[:3].reshape(bs,-1), bone_length.reshape(bs,-1)), dim=1)
+            cond = torch.cat((pose_to_camera[:, :, 0:3].reshape(bs,-1), bone_length.reshape(bs,-1)), dim=1)
             ws = self.mapping(z.repeat(bs,1), c=cond, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
             # triplanes: b x (channels+bones)*3 x 128 x 128
             triplanes = self.synthesis(ws[:, :self.synthesis.num_ws], update_emas=update_emas, **synthesis_kwargs)  
@@ -443,6 +453,15 @@ class ENARFGenerator(nn.Module):
         else:
             self.triplane_features = nn.Parameter( torch.randn(bs, 32*3, self.size, self.size).cuda(sampled_img_coord.device) )
             self.triplane_probs = nn.Parameter( torch.randn(bs, self.num_bone * 3, self.size, self.size).cuda(sampled_img_coord.device) )
+        
+        if self.config.dynamic:
+            cond = torch.cat((pose_to_camera[:, :, 0:3, 0:3].reshape(bs,-1), self.t.reshape(bs,-1)), dim=1)
+            if z.shape[0] != bs:
+                z = z.repeat(bs, 1)
+            ws = self.deform_mapping(z, c=cond, truncation_psi=truncation_psi, truncation_cutoff=truncation_cutoff, update_emas=update_emas)
+            triplanes = self.deform_synthesis(ws[:, :self.deform_synthesis.num_ws], update_emas=update_emas, **synthesis_kwargs)
+            self.deform_features = triplanes
+
         assert self.triplane_features.shape[1] == 96
         assert self.triplane_probs.shape[1] == 57
 
@@ -594,7 +613,12 @@ class Decoder(nn.Module):
 
 class LightweightDecoder(nn.Module):
     def __init__(self):
-        super().__init__()
+        super().__init__(in_c: int, 
+                        mid_c: int, 
+                        out_c: int, 
+                        num_layers = 3,
+                        activation ='relu', )
+        self.decoder = ModulatedConv2d(in_channel=32, out_channel=4, kernel_size=3, style_dim=self.c_dim)
 
     def forward(self):
         return
